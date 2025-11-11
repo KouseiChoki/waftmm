@@ -7,7 +7,7 @@ matplotlib
 scipy
 opencv-python
 tensorboard
-h5py
+# h5py
 tqdm
 einops
 torch

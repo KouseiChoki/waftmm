@@ -71,6 +71,9 @@ class WAFTv2(nn.Module):
         elif args.feature_encoder == 'dinov3':
             self.encoder = DinoV3Feature(model_name="vits", lvl=-3)
             self.factor = 16
+        elif args.feature_encoder == 'dinov3l':
+            self.encoder = DinoV3Feature(model_name="vitl", lvl=-3)
+            self.factor = 16
         else:
             raise ValueError(f"Unknown feature encoder: {args.feature_encoder}")
 

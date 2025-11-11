@@ -1,0 +1,26 @@
+{
+    "name": "kousei-v1",
+    "dataset": "unreal",
+    "gpus": [1],
+
+    "feature_encoder": "dinov3",
+    "iterative_module": "vits",
+    "algorithm": "waft-a2",
+    "use_var": true,
+    "var_min": 0,
+    "var_max": 10,
+    "iters": 5,
+
+    "image_size": [1080, 1920],
+    "scale": -1,
+    "batch_size": 1,
+    "epsilon": 1e-8,
+    "lr": 1e-4,
+    "wdecay": 1e-5,
+    "dropout": 0,
+    "clip": 1.0,
+    "gamma": 0.85,
+    "num_steps": 200000,
+
+    "restore_ckpt": null
+}
