@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as data
-
+import re,glob
 from config.parser import parse_args
 
 from model import fetch_model
@@ -17,7 +17,7 @@ from utils.flow_viz import flow_to_image
 from utils.utils import load_ckpt, coords_grid, bilinear_sampler
 
 from scipy.interpolate import griddata
-
+from tqdm import tqdm
 from dataloader.flow.chairs import FlyingChairs
 from dataloader.flow.sintel import MpiSintel
 from dataloader.flow.kitti import KITTI
@@ -25,7 +25,10 @@ from dataloader.flow.spring import Spring
 from dataloader.stereo.tartanair import TartanAir
 
 from inference_tools import InferenceWrapper, AverageMeter
+from utils.file_utils import read,write,mkdir,jhelp_file
 
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 def warp_with_flow(image, flow):
     N, _, H, W = image.shape
     coords2 = coords_grid(N, H, W, device=image.device).permute(0, 2, 3, 1)
@@ -120,6 +123,31 @@ def demo_data(name, args, model, image1, image2, flow_gt, valid=None, tiling=Fal
         epe = (epe * valid).sum() / valid.sum()
         print(f"EPE_step{i}: {epe.cpu().item()}")
 
+
+@torch.no_grad()
+def demo_one(name, args, model, image1, image2, flow_gt, valid=None, tiling=False):
+    output = model.calc_flow(image1, image2)
+    return output['flow'][-1][0]
+    for i in range(len(output['flow'])):
+        flow= output['flow'][i]
+        flow_vis = flow_to_image(flow[0].permute(1, 2, 0).cpu().numpy(), convert_to_bgr=True)
+        cv2.imwrite(f"{path}flow_{i}.jpg", flow_vis)
+        diff = flow_gt - flow
+        diff_vis = flow_to_image(diff[0].permute(1, 2, 0).cpu().numpy(), convert_to_bgr=True)
+        cv2.imwrite(f"{path}error_{i}.jpg", diff_vis)
+        if 'info' in output:
+            info = output['info'][i]
+            heatmap = get_heatmap(info, args)
+            vis_heatmap(f"{path}heatmap_{i}.jpg", image1[0].permute(1, 2, 0).cpu().numpy(), heatmap[0].permute(1, 2, 0).cpu().numpy())
+        if valid is None:
+            N, _, H, W = flow.shape
+            valid = torch.ones((N, H, W), device=flow.device)
+        else:
+            valid = valid.to(flow.device)
+        epe = torch.sum((flow - flow_gt)**2, dim=1).sqrt()
+        epe = (epe * valid).sum() / valid.sum()
+        print(f"EPE_step{i}: {epe.cpu().item()}")
+
 @torch.no_grad()
 def demo_chairs(model, args, device=torch.device('cuda')):
     dataset = FlyingChairs(split='training')
@@ -175,32 +203,69 @@ def demo_tartanair(model, args, device=torch.device('cuda')):
 
 @torch.no_grad()
 def demo_custom(model, args, device=torch.device('cuda')):
-    image1 = cv2.imread('datasets/KITTI/2015/testing/image_2/000168_10.png')
-    image1 = cv2.cvtColor(image1, cv2.COLOR_BGR2RGB)
-    image2 = cv2.imread('datasets/KITTI/2015/testing/image_2/000168_11.png')
-    image2 = cv2.cvtColor(image2, cv2.COLOR_BGR2RGB)
-    image1 = torch.tensor(image1, dtype=torch.float32).permute(2, 0, 1)
-    image2 = torch.tensor(image2, dtype=torch.float32).permute(2, 0, 1)
-    H, W = image1.shape[1:]
-    flow_gt = torch.zeros([2, H, W], device=device)
-    image1 = image1[None].to(device)
-    image2 = image2[None].to(device)
-    flow_gt = flow_gt[None].to(device)
-    demo_data('custom_downsample', args, model, image1, image2, flow_gt)
+    resize_rate_x =0.5
+    resize_rate_y =0.5
+    prepares = []
+    if os.path.basename(args.root) == args.img_folder_name:
+        filenames = glob.glob(os.path.join(args.root, '*'))
+    else:   
+        filenames = glob.glob(os.path.join(args.root, f'**/{args.img_folder_name}/*'), recursive=True)
+    filenames = sorted(filenames, key=lambda x: int(re.findall(r'(\d+)', x)[-1]))
+    for f in filenames:
+        prepares.append(f)
+
+    cy = tqdm(range(len(prepares)-1))
+    for k in cy: #mv0
+        image1 = read(prepares[k],type='image')
+        image2 = read(prepares[k+1],type='image')
+
+        image1 = torch.tensor(image1, dtype=torch.float32).permute(2, 0, 1)
+        image2 = torch.tensor(image2, dtype=torch.float32).permute(2, 0, 1)
+        _,H, W = image1.shape
+        target_H,target_W = int(H*resize_rate_y),int(W*resize_rate_x)
+        image1 = image1[None].to(device)
+        image2 = image2[None].to(device)
+        image1_resized = F.interpolate(image1, size=(target_H, target_W), mode='bilinear', align_corners=False)
+        image2_resized = F.interpolate(image2, size=(target_H, target_W), mode='bilinear', align_corners=False)
+        output = model.calc_flow(image1_resized, image2_resized)
+        last = os.path.basename(prepares[k]).split('.')[-1]
+        flow = output['flow'][-1].detach().cpu()
+        flow = F.interpolate(flow, size=(H,W), mode='bilinear', align_corners=False)[0].numpy()
+        flow[0,:,:] /= resize_rate_x
+        flow[1,:,:] /= resize_rate_y
+        output_path = os.path.join(args.output,os.path.basename(prepares[k]).replace(f'.{last}',''))+f'.flo'
+        write(output_path,np.transpose(flow,(1,2,0)))
+# def demo_custom(model, args, device=torch.device('cuda')):
+#     image1 = cv2.imread('datasets/KITTI/2015/testing/image_2/000168_10.png')
+#     image1 = cv2.cvtColor(image1, cv2.COLOR_BGR2RGB)
+#     image2 = cv2.imread('datasets/KITTI/2015/testing/image_2/000168_11.png')
+#     image2 = cv2.cvtColor(image2, cv2.COLOR_BGR2RGB)
+#     image1 = torch.tensor(image1, dtype=torch.float32).permute(2, 0, 1)
+#     image2 = torch.tensor(image2, dtype=torch.float32).permute(2, 0, 1)
+#     H, W = image1.shape[1:]
+#     flow_gt = torch.zeros([2, H, W], device=device)
+#     image1 = image1[None].to(device)
+#     image2 = image2[None].to(device)
+#     flow_gt = flow_gt[None].to(device)
+#     demo_data('custom_downsample', args, model, image1, image2, flow_gt)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', help='experiment configure file name', required=True, type=str)
     parser.add_argument('--ckpt', help='checkpoint path', required=True, type=str)
-    parser.add_argument('--dataset', help='dataset to evaluate on', choices=['chairs', 'sintel', 'spring', 'tartanair', 'kitti'], required=True, type=str)
+    parser.add_argument('--dataset', help='dataset to evaluate on', choices=['chairs', 'sintel', 'spring', 'tartanair', 'kitti','custom'], default='custom', type=str)
     parser.add_argument('--scale', help='scale factor for input images', default=0.0, type=float)
+    parser.add_argument('--img_folder_name', type=str, default='image',help='batch run"s folder name')
+    parser.add_argument('--root', type=str,required=True)
+    parser.add_argument('--output', type=str, default='',help='output path')
     args = parse_args(parser)
     model = fetch_model(args)
     load_ckpt(model, args.ckpt)
-    model = model.cuda()
+    
+    model = model.to(DEVICE)
     model.eval()
     wrapped_model = InferenceWrapper(model, scale=args.scale, train_size=args.image_size, pad_to_train_size=False, tiling=False)
-    
+    # --cfg /Users/qhong/Documents/MM/WAFT/config/a2/dinov3/tar-c-t-spring-540p.json --ckpt /Users/qhong/Documents/MM/WAFT/waftv2-ckpts/dinov3/spring.pth --root /Users/qhong/Desktop/1104/spring_0028 --output /Users/qhong/Desktop/1104/output
     if args.dataset == 'chairs':
         demo_chairs(wrapped_model, args)
     elif args.dataset == 'sintel':
@@ -211,6 +276,8 @@ def main():
         demo_tartanair(wrapped_model, args)
     elif args.dataset == 'kitti':
         demo_kitti(wrapped_model, args)
+    elif args.dataset == 'custom':
+        demo_custom(wrapped_model,args,DEVICE)\
 
 if __name__ == '__main__':
     main()
